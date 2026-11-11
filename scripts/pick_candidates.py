@@ -4,11 +4,14 @@
 输出当期机会标的 + 自选股当日评估，落成 JSON 简报和 Markdown 简报，
 并把简报写进 Supabase briefs 表（写库失败只记日志，不影响文件产出）。
 
-模型（2026-11-11 核实，OpenRouter :free 免费模型，名单常变，按顺序试）：
-  meta-llama/llama-3.3-70b-instruct:free（主用）
+模型（2026-11-11 约 18:20 重新核实，OpenRouter :free 免费模型，名单常变，按顺序试）：
+  google/gemma-4-31b-it:free（主用）
   google/gemma-4-26b-a4b-it:free
+  nvidia/nemotron-3.5-super-vl:free
+  baidu/ernie-5.5-flash-preview:free
   nvidia/nemotron-3.5-lightning:free
-  openrouter/free（官方免费路由器，随机挑一个免费模型）
+已下架，不要再用：meta-llama/llama-3.3-70b-instruct:free（2026-11-11 起
+免费版 404，只剩付费版）、openrouter/free（自动路由曾返回无法解析的 JSON）。
 免费额度：每天 50 次调用（未充值）；本管道每天只调 2 次（早晚各 1 次）。
 
 用法：
@@ -33,12 +36,18 @@ logger = logging.getLogger("xiaoyuan")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# 免费模型候选（按顺序试；名单常变，某个下线就自动试下一个）
+# 免费模型候选（按顺序试；名单常变，某个下线就自动试下一个）。
+# 2026-11-11 约 18:20 对 OpenRouter 实时清单核对过，这 5 个都在 :free 清单里：
+# gemma-4-31b（主用，31B 指令模型）、gemma-4-26b（26B MoE，上次 429 是临时限流）、
+# nemotron-3.5-super-vl、ernie-5.5-flash-preview（百度，中文强）、nemotron-3.5-lightning。
+# 已删：meta-llama/llama-3.3-70b-instruct:free（免费版已下架，404）、
+# openrouter/free（自动路由返回过无法解析的 JSON）。
 MODEL_CANDIDATES = [
-    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
+    "nvidia/nemotron-3.5-super-vl:free",
+    "baidu/ernie-5.5-flash-preview:free",
     "nvidia/nemotron-3.5-lightning:free",
-    "openrouter/free",
 ]
 
 # 场次 -> 覆盖市场（早上出 A股+港股，晚上出美股）
@@ -224,60 +233,119 @@ def build_prompt(session, news_data, watchlist, quotes):
     return system, user
 
 
+def _extract_json(text):
+    """从模型返回文本里提取 JSON 对象。
+
+    依次尝试：整体解析 → 去 ```json 围栏后解析 → 截第一个 { 到最后一个 }
+    之间的内容解析 → 贪婪匹配 { ... } 解析。模型常在 JSON 前后加解释
+    文字或用围栏包裹，整体解析失败不等于没返回 JSON。
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("模型返回为空")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fenced:
+        try:
+            return json.loads(fenced.group(1))
+        except json.JSONDecodeError:
+            pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return json.loads(match.group(0))
+    raise ValueError("模型返回不是 JSON")
+
+
 def call_openrouter(api_key, system, user, model_override=None):
-    """按候选顺序调 OpenRouter，返回 (模型名, 解析后的 JSON)。全失败抛错。"""
+    """按候选顺序调 OpenRouter，返回 (模型名, 解析后的 JSON)。全失败抛错。
+
+    加固（2026-11-11 run #2 的教训）：
+    - HTTP 429（上游临时限流）：每个模型等 30 秒后重试一次，再换下一个。
+    - 响应体不是合法 JSON / 缺 choices 字段 / 带 error 字段时，记清原因
+      再换下一个，不再让 KeyError 这类原始异常直接冒泡成“全部失败”。
+    - 请求头只用 ASCII（X-Title 曾写中文导致 latin-1 编码报错），
+      请求体用 UTF-8 字节发。
+    """
     import requests
 
     models = [model_override] if model_override else MODEL_CANDIDATES
     last_error = None
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json; charset=utf-8",
+        "HTTP-Referer": "https://github.com/mashaozhi/ai-studio",
+        "X-Title": "Xiaoyuan Investment Brief",
+    }
+    payload_template = {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 4000,
+    }
     for model in models:
-        try:
-            # 请求头只能是 ASCII：urllib3 会按 latin-1 编码请求头，
-            # 之前这里的 X-Title 写中文“小源投研简报”，四个模型全部报
-            # 'latin-1' codec can't encode characters。
-            # 请求体用 UTF-8 字节发（json= 默认会转义成 \uXXXX 也是安全的，
-            # 这里显式编码更稳妥），并带 charset=utf-8。
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.3,
-                "max_tokens": 4000,
-            }
-            resp = requests.post(
-                OPENROUTER_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json; charset=utf-8",
-                    "HTTP-Referer": "https://github.com/mashaozhi/ai-studio",
-                    "X-Title": "Xiaoyuan Investment Brief",
-                },
-                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                timeout=120,
-            )
+        payload = dict(payload_template, model=model)
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        for attempt in (1, 2):
+            try:
+                resp = requests.post(
+                    OPENROUTER_URL, headers=headers, data=body, timeout=120
+                )
+            except Exception as exc:  # noqa: BLE001 - 网络异常不重试，换下一个
+                last_error = f"{model} 请求异常: {exc}"
+                logger.warning("模型 %s 请求异常，换下一个: %s", model, exc)
+                break
+            if resp.status_code == 429:
+                if attempt == 1:
+                    logger.warning("模型 %s 被限流（429），30 秒后重试一次", model)
+                    time.sleep(30)
+                    continue
+                last_error = f"{model} HTTP 429: {resp.text[:300]}"
+                logger.warning("模型 %s 限流重试后仍 429，换下一个", model)
+                break
             if resp.status_code != 200:
                 last_error = f"{model} HTTP {resp.status_code}: {resp.text[:300]}"
                 logger.warning("模型 %s 调用失败: %s", model, last_error)
-                continue
-            content = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-            content = re.sub(r"^```(?:json)?\s*", "", content)
-            content = re.sub(r"\s*```$", "", content)
+                break
             try:
-                data = json.loads(content)
-            except json.JSONDecodeError:
-                match = re.search(r"\{.*\}", content, re.DOTALL)
-                if not match:
-                    raise ValueError("模型返回不是 JSON")
-                data = json.loads(match.group(0))
+                raw = resp.json()
+            except ValueError:
+                last_error = f"{model} 返回不是 JSON: {resp.text[:300]}"
+                logger.warning("模型 %s 失败，换下一个: %s", model, last_error)
+                break
+            if isinstance(raw, dict) and raw.get("error"):
+                last_error = f"{model} 返回错误: {raw['error']}"
+                logger.warning("模型 %s 失败，换下一个: %s", model, last_error)
+                break
+            try:
+                content = (raw["choices"][0]["message"]["content"] or "").strip()
+            except (KeyError, IndexError, TypeError):
+                last_error = f"{model} 返回缺少 choices: {str(raw)[:300]}"
+                logger.warning("模型 %s 失败，换下一个: %s", model, last_error)
+                break
+            try:
+                data = _extract_json(content)
+            except Exception as exc:  # noqa: BLE001 - 解析失败就换下一个模型
+                last_error = f"{model} 返回无法解析为 JSON: {exc}"
+                logger.warning("模型 %s 失败，换下一个: %s", model, last_error)
+                break
             if not isinstance(data, dict) or "candidates" not in data:
-                raise ValueError("模型返回缺少 candidates 字段")
+                last_error = f"{model} 返回缺少 candidates 字段"
+                logger.warning("模型 %s 失败，换下一个: %s", model, last_error)
+                break
             logger.info("模型 %s 返回成功", model)
             return model, data
-        except Exception as exc:  # noqa: BLE001 - 换下一个模型试
-            last_error = str(exc)
-            logger.warning("模型 %s 失败，换下一个: %s", model, exc)
         time.sleep(1)
     raise RuntimeError(f"OpenRouter 免费模型全部失败，最后错误：{last_error}")
 
