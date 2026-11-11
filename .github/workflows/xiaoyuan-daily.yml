@@ -1,0 +1,81 @@
+# 小源每日投研简报：GitHub Actions 定时任务
+# 每天跑两次（北京时间）：
+#   - 早上 08:30（00:30 UTC）：A股+港股盘前简报（两边 09:30 开盘）
+#   - 晚上 21:00（13:00 UTC）：美股盘前简报（夏令时 21:30 开盘）
+# 也可以在 Actions 页面点 Run workflow 手动跑（可指定场次）。
+# 全链路：新闻扫描 → 选标的出简报 → 拉候选与自选股行情入库 → 上传简报文件
+name: 小源每日投研简报
+
+on:
+  schedule:
+    - cron: "30 0 * * *"
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+    inputs:
+      session:
+        description: "简报场次（留空按时间自动判断）"
+        required: false
+        default: "auto"
+        type: choice
+        options: [auto, morning, evening]
+
+permissions:
+  contents: read
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install yfinance requests feedparser
+
+      - name: 判断场次
+        id: session
+        run: |
+          if [ "${{ inputs.session }}" != "" ] && [ "${{ inputs.session }}" != "auto" ]; then
+            echo "session=${{ inputs.session }}" >> "$GITHUB_OUTPUT"
+          else
+            hour=$(date -u +%H)
+            if [ "$hour" -lt 12 ]; then
+              echo "session=morning" >> "$GITHUB_OUTPUT"
+            else
+              echo "session=evening" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: 扫描新闻与指数
+        run: python scripts/news_scan.py --session "${{ steps.session.outputs.session }}" --out out/news_scan.json
+
+      - name: 选标的并出简报
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: python scripts/pick_candidates.py --session "${{ steps.session.outputs.session }}" --news out/news_scan.json --out-dir out
+
+      - name: 拉取候选与自选股行情
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          brief=$(ls out/brief_*_${{ steps.session.outputs.session }}.json | head -n 1)
+          if [ "${{ steps.session.outputs.session }}" = "morning" ]; then
+            python scripts/fetch_quotes.py --market CN,HK --symbols-json "$brief"
+          else
+            python scripts/fetch_quotes.py --market US --symbols-json "$brief"
+          fi
+
+      - name: 上传简报
+        uses: actions/upload-artifact@v4
+        with:
+          name: brief-${{ steps.session.outputs.session }}-${{ github.run_id }}
+          path: out/brief_*_${{ steps.session.outputs.session }}.*
+          if-no-files-found: error
