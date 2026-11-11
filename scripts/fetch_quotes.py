@@ -51,17 +51,31 @@ def load_watchlist_supabase(base_url, api_key):
     """读 Supabase watchlist 表（自选股），返回 {市场: [{symbol, name}]}。
 
     表为空也照常返回空字典（只拉候选标的），不报错。
+    与 pick_candidates.py 同理：先按 symbol 排序查（symbol 是主键列，
+    一定在），失败就去掉排序重试一次，避免表刚建完、PostgREST schema
+    缓存未刷新时一个 400 就丢掉整个自选表。
     """
     import requests
 
     url = base_url.rstrip("/") + "/rest/v1/watchlist"
-    resp = requests.get(
-        url,
-        params={"select": "symbol,market,name", "order": "added_at.asc"},
-        headers={"apikey": api_key, "Authorization": f"Bearer {api_key}"},
-        timeout=15,
-    )
-    resp.raise_for_status()
+    try:
+        resp = requests.get(
+            url,
+            params={"select": "symbol,market,name", "order": "symbol.asc"},
+            headers={"apikey": api_key, "Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - 排序查询失败就去掉排序重试
+        logger.warning("读 watchlist（带排序）失败，去掉排序重试一次: %s", exc)
+        time.sleep(2)
+        resp = requests.get(
+            url,
+            params={"select": "symbol,market,name"},
+            headers={"apikey": api_key, "Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
     markets = {}
     for row in resp.json() or []:
         market = (row.get("market") or "").strip().upper()

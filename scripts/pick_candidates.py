@@ -67,13 +67,28 @@ def supabase_get(base_url, api_key, table, params):
 
 
 def load_watchlist(base_url, api_key):
-    """读 Supabase watchlist 表（自选股）；表是空的也照常返回空列表。"""
-    rows = supabase_get(
-        base_url,
-        api_key,
-        "watchlist",
-        {"select": "symbol,market,name,note", "order": "added_at.asc"},
-    )
+    """读 Supabase watchlist 表（自选股）；表是空的也照常返回空列表。
+
+    注意：002 建的 watchlist 表里有 added_at 列（timestamptz，default now()），
+    没有 created_at 列——按 added_at 排序本身没错。但表刚建完就跑工作流时，
+    PostgREST 的 schema 缓存可能还没刷出来，带 order 的查询会报 400。
+    所以先按 symbol 排序查（symbol 是主键列，一定在），失败就去掉排序
+    重试一次；两次都失败才抛错（main 里会按空自选股跑，不会因为
+    查不到自选股就丢掉整期简报）。
+    """
+    try:
+        rows = supabase_get(
+            base_url,
+            api_key,
+            "watchlist",
+            {"select": "symbol,market,name,note", "order": "symbol.asc"},
+        )
+    except Exception as exc:  # noqa: BLE001 - 排序查询失败就去掉排序重试
+        logger.warning("读 watchlist（带排序）失败，去掉排序重试一次: %s", exc)
+        time.sleep(2)
+        rows = supabase_get(
+            base_url, api_key, "watchlist", {"select": "symbol,market,name,note"}
+        )
     out = []
     for row in rows:
         market = (row.get("market") or "").strip().upper()
@@ -217,23 +232,29 @@ def call_openrouter(api_key, system, user, model_override=None):
     last_error = None
     for model in models:
         try:
+            # 请求头只能是 ASCII：urllib3 会按 latin-1 编码请求头，
+            # 之前这里的 X-Title 写中文“小源投研简报”，四个模型全部报
+            # 'latin-1' codec can't encode characters。
+            # 请求体用 UTF-8 字节发（json= 默认会转义成 \uXXXX 也是安全的，
+            # 这里显式编码更稳妥），并带 charset=utf-8。
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 4000,
+            }
             resp = requests.post(
                 OPENROUTER_URL,
                 headers={
                     "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
+                    "Content-Type": "application/json; charset=utf-8",
                     "HTTP-Referer": "https://github.com/mashaozhi/ai-studio",
-                    "X-Title": "小源投研简报",
+                    "X-Title": "Xiaoyuan Investment Brief",
                 },
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 4000,
-                },
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 timeout=120,
             )
             if resp.status_code != 200:
