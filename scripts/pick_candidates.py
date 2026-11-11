@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""小源的选股：把新闻摘要 + 指数 + 自选股最新行情喂给 OpenRouter 免费模型，
+"""小源的选股：把新闻摘要 + 指数 + 自选股最新行情喂给 OpenRouter 付费模型，
 输出当期机会标的 + 自选股当日评估，落成 JSON 简报和 Markdown 简报，
 并把简报写进 Supabase briefs 表（写库失败只记日志，不影响文件产出）。
 
-模型（2026-11-11 约 18:20 重新核实，OpenRouter :free 免费模型，名单常变，按顺序试）：
-  google/gemma-4-31b-it:free（主用）
-  google/gemma-4-26b-a4b-it:free
-  nvidia/nemotron-3.5-super-vl:free
-  baidu/ernie-5.5-flash-preview:free
-  nvidia/nemotron-3.5-lightning:free
-已下架，不要再用：meta-llama/llama-3.3-70b-instruct:free（2026-11-11 起
-免费版 404，只剩付费版）、openrouter/free（自动路由曾返回无法解析的 JSON）。
-免费额度：每天 50 次调用（未充值）；本管道每天只调 2 次（早晚各 1 次）。
+模型：openai/gpt-5-mini（付费模型；账号已充值 10 美元信用额，不再遍历免费模型）。
+免费模型已不可靠，不再使用：meta-llama/llama-3.3-70b-instruct:free（免费版已下架，404）、
+google/gemma-4-26b-a4b-it:free（上游限流 429）、openrouter/free（自动路由曾返回无法解析的 JSON）。
+本管道每天只调 2 次（早晚各 1 次）。
 
 用法：
   python scripts/pick_candidates.py --session morning|evening
@@ -36,18 +31,9 @@ logger = logging.getLogger("xiaoyuan")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# 免费模型候选（按顺序试；名单常变，某个下线就自动试下一个）。
-# 2026-11-11 约 18:20 对 OpenRouter 实时清单核对过，这 5 个都在 :free 清单里：
-# gemma-4-31b（主用，31B 指令模型）、gemma-4-26b（26B MoE，上次 429 是临时限流）、
-# nemotron-3.5-super-vl、ernie-5.5-flash-preview（百度，中文强）、nemotron-3.5-lightning。
-# 已删：meta-llama/llama-3.3-70b-instruct:free（免费版已下架，404）、
-# openrouter/free（自动路由返回过无法解析的 JSON）。
+# 默认模型：openai/gpt-5-mini（付费；账号已充值，不再遍历免费模型）。
 MODEL_CANDIDATES = [
-    "google/gemma-4-31b-it:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "nvidia/nemotron-3.5-super-vl:free",
-    "baidu/ernie-5.5-flash-preview:free",
-    "nvidia/nemotron-3.5-lightning:free",
+  "openai/gpt-5-mini",
 ]
 
 # 场次 -> 覆盖市场（早上出 A股+港股，晚上出美股）
@@ -347,7 +333,7 @@ def call_openrouter(api_key, system, user, model_override=None):
             logger.info("模型 %s 返回成功", model)
             return model, data
         time.sleep(1)
-    raise RuntimeError(f"OpenRouter 免费模型全部失败，最后错误：{last_error}")
+    raise RuntimeError(f"OpenRouter 模型全部失败，最后错误：{last_error}")
 
 
 def validate_candidates(raw, markets):
@@ -533,7 +519,7 @@ def main():
     parser.add_argument("--session", default="morning", choices=["morning", "evening"])
     parser.add_argument("--news", default="out/news_scan.json")
     parser.add_argument("--out-dir", default="out")
-    parser.add_argument("--model", default="", help="指定模型（默认按候选顺序自动试）")
+    parser.add_argument("--model", default="", help="指定模型（默认 openai/gpt-5-mini）")
     parser.add_argument("--dry-run", action="store_true", help="只打印提示词、不调模型")
     args = parser.parse_args()
 
