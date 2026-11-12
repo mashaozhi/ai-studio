@@ -29,7 +29,7 @@ jobs:
           kaggle kernels push -p .
           echo "kernel 已触发，开始轮询状态…"
           for i in $(seq 1 40); do
-            status=$(kaggle kernels status shaozhima2026/xiaoyuan-daily-brief)
+            status=$(kaggle kernels status shaozhima2026/xiaoyuan-daily-brief | tr '[:upper:]' '[:lower:]')
             echo "第 $i 次检查：$status"
             case "$status" in
               *complete*) echo "kernel 跑完了，简报已写进 Supabase"; exit 0;;
