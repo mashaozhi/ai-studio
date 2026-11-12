@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""小源的选股：把新闻摘要 + 指数 + 自选股最新行情喂给 OpenRouter 免费模型，
+"""小源的选股：把新闻摘要 + 指数 + 自选股最新行情喂给模型
+（OpenRouter 免费模型，或本地 OpenAI 兼容接口），
 输出当期机会标的 + 自选股当日评估，落成 JSON 简报和 Markdown 简报，
 并把简报写进 Supabase briefs 表（写库失败只记日志，不影响文件产出）。
 
@@ -13,6 +14,12 @@
 已下架，不要再用：meta-llama/llama-3.3-70b-instruct:free（2026-11-11 起
 免费版 404，只剩付费版）、openrouter/free（自动路由曾返回无法解析的 JSON）。
 免费额度：每天 50 次调用（未充值）；本管道每天只调 2 次（早晚各 1 次）。
+
+本地模式（2026-11-12 新增）：在她自己电脑上跑时，模型走本地 OpenAI 兼容接口，
+不用 OpenRouter、不花钱。环境变量：
+  LLM_BASE_URL：接口地址，如 http://127.0.0.1:38650/v1（不填则默认 OpenRouter）
+  LLM_API_KEY：接口 key（不填则读 OPENROUTER_API_KEY）
+  LLM_MODEL：指定模型名（可选；不填时自动调接口的 /v1/models 取第一个）
 
 用法：
   python scripts/pick_candidates.py --session morning|evening
@@ -35,20 +42,62 @@ from pathlib import Path
 logger = logging.getLogger("xiaoyuan")
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def resolve_llm_config(api_key, model_override=None):
+    """决定本次用的接口地址、key 和模型列表。
+
+    优先级：--model > LLM_MODEL 环境变量 > 本地接口自动探测（调 {base}/models 取
+    第一个）> OpenRouter 免费候选清单。base 来自 LLM_BASE_URL（默认 OpenRouter）。
+    返回 (base_url, api_key, models, is_openrouter)；本地接口探测不到模型时
+    models 为空列表，调用方应报清晰错误而不是拿 OpenRouter 的模型名去试本地接口。
+    """
+    import requests
+
+    base_url = os.environ.get("LLM_BASE_URL", "").strip() or DEFAULT_BASE_URL
+    base_url = base_url.rstrip("/")
+    is_openrouter = "openrouter.ai" in base_url
+    if model_override:
+        return base_url, api_key, [model_override], is_openrouter
+    env_model = os.environ.get("LLM_MODEL", "").strip()
+    if env_model:
+        return base_url, api_key, [env_model], is_openrouter
+    if not is_openrouter:
+        try:
+            resp = requests.get(
+                base_url + "/models",
+                headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            ids = [
+                m.get("id")
+                for m in (resp.json().get("data") or [])
+                if isinstance(m, dict) and m.get("id")
+            ]
+            if ids:
+                logger.info("本地接口自动探测到模型：%s", ids[0])
+                return base_url, api_key, [ids[0]], is_openrouter
+            logger.warning("本地接口 /v1/models 未返回模型列表")
+        except Exception as exc:  # noqa: BLE001 - 探测失败就返回空列表，调用方报错
+            logger.warning("本地接口模型探测失败：%s", exc)
+        return base_url, api_key, [], is_openrouter
+    return base_url, api_key, MODEL_CANDIDATES, is_openrouter
 
 # 免费模型候选（按顺序试；名单常变，某个下线就自动试下一个）。
 # 2026-11-11 约 18:20 对 OpenRouter 实时清单核对过，这 5 个都在 :free 清单里：
 # gemma-4-31b（主用，31B 指令模型）、gemma-4-26b（26B MoE，上次 429 是临时限流）、
 # nemotron-3.5-super-vl、ernie-5.5-flash-preview（百度，中文强）、nemotron-3.5-lightning。
 # 已删：meta-llama/llama-3.3-70b-instruct:free（免费版已下架，404）、
-# openrouter/free（自动路由曾返回无法解析的 JSON）。
+# openrouter/free（自动路由返回过无法解析的 JSON）。
 MODEL_CANDIDATES = [
     "google/gemma-4-31b-it:free",
     "google/gemma-4-26b-a4b-it:free",
     "nvidia/nemotron-3.5-super-vl:free",
     "baidu/ernie-5.5-flash-preview:free",
     "nvidia/nemotron-3.5-lightning:free",
-]  
+]
 
 # 场次 -> 覆盖市场（早上出 A股+港股，晚上出美股）
 SESSION_MARKETS = {"morning": ["CN", "HK"], "evening": ["US"]}
@@ -266,26 +315,31 @@ def _extract_json(text):
     raise ValueError("模型返回不是 JSON")
 
 
-def call_openrouter(api_key, system, user, model_override=None):
-    """按候选顺序调 OpenRouter，返回 (模型名, 解析后的 JSON)。全失败抛错。
+def call_llm(base_url, api_key, models, is_openrouter, system, user):
+    """按候选顺序调模型（OpenRouter 或本地 OpenAI 兼容接口），返回 (模型名, 解析后的 JSON)。全失败抛错。
 
     加固（2026-11-11 run #2 的教训）：
     - HTTP 429（上游临时限流）：每个模型等 30 秒后重试一次，再换下一个。
     - 响应体不是合法 JSON / 缺 choices 字段 / 带 error 字段时，记清原因
       再换下一个，不再让 KeyError 这类原始异常直接冒泡成“全部失败”。
-    - 请求头只用 ASCII（X-Title 曾写中文导致 latin-1 编码报错），
-      请求体用 UTF-8 字节发。
+    - 发 OpenRouter 时请求头只用 ASCII（X-Title 曾写中文导致 latin-1 编码报错），
+      请求体用 UTF-8 字节发；本地接口不发 OpenRouter 专用的请求头。
     """
     import requests
 
-    models = [model_override] if model_override else MODEL_CANDIDATES
+    if not models:
+        raise RuntimeError(
+            "未指定模型：本地接口请设 LLM_MODEL 环境变量，或保证接口的 /v1/models 能返回模型列表"
+        )
+    chat_url = base_url.rstrip("/") + "/chat/completions"
     last_error = None
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json; charset=utf-8",
-        "HTTP-Referer": "https://github.com/mashaozhi/ai-studio",
-        "X-Title": "Xiaoyuan Investment Brief",
     }
+    if is_openrouter:
+        headers["HTTP-Referer"] = "https://github.com/mashaozhi/ai-studio"
+        headers["X-Title"] = "Xiaoyuan Investment Brief"
     payload_template = {
         "messages": [
             {"role": "system", "content": system},
@@ -300,7 +354,7 @@ def call_openrouter(api_key, system, user, model_override=None):
         for attempt in (1, 2):
             try:
                 resp = requests.post(
-                    OPENROUTER_URL, headers=headers, data=body, timeout=120
+                    chat_url, headers=headers, data=body, timeout=120
                 )
             except Exception as exc:  # noqa: BLE001 - 网络异常不重试，换下一个
                 last_error = f"{model} 请求异常: {exc}"
@@ -347,7 +401,7 @@ def call_openrouter(api_key, system, user, model_override=None):
             logger.info("模型 %s 返回成功", model)
             return model, data
         time.sleep(1)
-    raise RuntimeError(f"OpenRouter 免费模型全部失败，最后错误：{last_error}")
+    raise RuntimeError(f"模型全部失败，最后错误：{last_error}")
 
 
 def validate_candidates(raw, markets):
@@ -548,12 +602,15 @@ def main():
 
     supabase_url = os.environ.get("SUPABASE_URL", "").strip()
     supabase_key = os.environ.get("SUPABASE_ANON_KEY", "").strip()
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    llm_key = (
+        os.environ.get("LLM_API_KEY", "").strip()
+        or os.environ.get("OPENROUTER_API_KEY", "").strip()
+    )
     if not supabase_url or not supabase_key:
         print("缺少环境变量 SUPABASE_URL 或 SUPABASE_ANON_KEY", file=sys.stderr)
         return 2
-    if not openrouter_key and not args.dry_run:
-        print("缺少环境变量 OPENROUTER_API_KEY", file=sys.stderr)
+    if not llm_key and not args.dry_run:
+        print("缺少环境变量 LLM_API_KEY（或 OPENROUTER_API_KEY）", file=sys.stderr)
         return 2
 
     markets = SESSION_MARKETS[args.session]
@@ -582,7 +639,8 @@ def main():
         logger.info("[DRY RUN] 未调模型")
         return 0
 
-    model_used, data = call_openrouter(openrouter_key, system, user, args.model or None)
+    base_url, llm_key, models, is_openrouter = resolve_llm_config(llm_key, args.model or None)
+    model_used, data = call_llm(base_url, llm_key, models, is_openrouter, system, user)
     candidates = validate_candidates(data.get("candidates"), markets)
     evals = validate_watchlist_evals(data.get("watchlist"), watchlist, markets)
     logger.info("候选标的 %d 只，自选股评估 %d 只（模型：%s）", len(candidates), len(evals), model_used)
