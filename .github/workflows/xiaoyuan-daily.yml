@@ -1,81 +1,41 @@
-# 小源每日投研简报：GitHub Actions 定时任务
-# 每天跑两次（北京时间）：
-#   - 早上 08:30（00:30 UTC）：A股+港股盘前简报（两边 09:30 开盘）
-#   - 晚上 21:00（13:00 UTC）：美股盘前简报（夏令时 21:30 开盘）
-# 也可以在 Actions 页面点 Run workflow 手动跑（可指定场次）。
-# 全链路：新闻扫描 → 选标的出简报 → 拉候选与自选股行情入库 → 上传简报文件
-name: 小源每日投研简报
+name: 小源每日投研简报（Kaggle）
 
+# 每天两次触发 Kaggle kernel 跑当期简报（Qwen3-8B + 会话内本地服务 + 三步管道），
+# 简报写进 Supabase briefs 表。云端直接跑模型已废弃（OpenRouter 免费层不可用，
+# 本地电脑路线已改走 Kaggle）。
 on:
   schedule:
-    - cron: "30 0 * * *"
-    - cron: "0 13 * * *"
+    - cron: "0 0 * * *"      # 每天 08:00 CST，早盘（A股+港股）
+    - cron: "30 12 * * *"    # 每天 20:30 CST，晚盘（美股）
   workflow_dispatch:
-    inputs:
-      session:
-        description: "简报场次（留空按时间自动判断）"
-        required: false
-        default: "auto"
-        type: choice
-        options: [auto, morning, evening]
-
-permissions:
-  contents: read
 
 jobs:
-  brief:
+  kaggle-brief:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      - name: 安装 Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: 安装 Kaggle CLI
+        run: pip install kaggle
 
-      - name: 安装依赖
-        run: pip install yfinance requests feedparser
-
-      - name: 判断场次
-        id: session
-        run: |
-          if [ "${{ inputs.session }}" != "" ] && [ "${{ inputs.session }}" != "auto" ]; then
-            echo "session=${{ inputs.session }}" >> "$GITHUB_OUTPUT"
-          else
-            hour=$(date -u +%H)
-            if [ "$hour" -lt 12 ]; then
-              echo "session=morning" >> "$GITHUB_OUTPUT"
-            else
-              echo "session=evening" >> "$GITHUB_OUTPUT"
-            fi
-          fi
-
-      - name: 扫描新闻与指数
-        run: python scripts/news_scan.py --session "${{ steps.session.outputs.session }}" --out out/news_scan.json
-
-      - name: 选标的并出简报
+      - name: 触发 Kaggle kernel 并轮询
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: python scripts/pick_candidates.py --session "${{ steps.session.outputs.session }}" --news out/news_scan.json --out-dir out
-
-      - name: 拉取候选与自选股行情
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          brief=$(ls out/brief_*_${{ steps.session.outputs.session }}.json | head -n 1)
-          if [ "${{ steps.session.outputs.session }}" = "morning" ]; then
-            python scripts/fetch_quotes.py --market CN,HK --symbols-json "$brief"
-          else
-            python scripts/fetch_quotes.py --market US --symbols-json "$brief"
-          fi
-
-      - name: 上传简报
-        uses: actions/upload-artifact@v4
-        with:
-          name: brief-${{ steps.session.outputs.session }}-${{ github.run_id }}
-          path: out/brief_*_${{ steps.session.outputs.session }}.*
-          if-no-files-found: error
+          cd kaggle-kernel
+          # 每次 push 都带一个时间戳注释，保证产生新版本、触发一次运行
+          echo "# run $(date -u +%Y%m%dT%H%M%S)Z" >> xiaoyuan_brief.py
+          kaggle kernels push -p .
+          echo "kernel 已触发，开始轮询状态…"
+          for i in $(seq 1 40); do
+            status=$(kaggle kernels status shaozhima2026/xiaoyuan-daily-brief)
+            echo "第 $i 次检查：$status"
+            case "$status" in
+              *complete*) echo "kernel 跑完了，简报已写进 Supabase"; exit 0;;
+              *error*|*fail*|*cancel*) echo "kernel 失败，请看 Kaggle 日志"; exit 1;;
+            esac
+            sleep 60
+          done
+          echo "轮询 40 分钟仍未完成，超时退出"; exit 1
