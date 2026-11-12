@@ -5,8 +5,8 @@ name: 小源每日投研简报（Kaggle）
 # 本地电脑路线已改走 Kaggle）。
 on:
   schedule:
-    - cron: "0 0 * * *"      # 每天 08:00 CST，早盘（A股+港股）
-    - cron: "30 12 * * *"    # 每天 20:30 CST，晚盘（美股）
+    - cron: "0 0 * * *"        # 每天 08:00 CST, 早盘（A股+港股）
+    - cron: "30 12 * * *"     # 每天 20:30 CST, 晚盘（美股）
   workflow_dispatch:
 
 jobs:
@@ -21,8 +21,7 @@ jobs:
 
       - name: 触发 Kaggle kernel 并轮询
         env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
         run: |
           cd kaggle-kernel
           # 每次 push 都带一个时间戳注释，保证产生新版本、触发一次运行
