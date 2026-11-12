@@ -201,7 +201,6 @@ def session_for_now():
 def main():
     session, now = session_for_now()
     date_str = now.strftime("%Y-%m-%d")
-    brief_stamp = now.strftime("%Y%m%d")
     logger.info("本次场次：%s（北京时间 %s）", session, now.strftime("%Y-%m-%d %H:%M"))
     supabase_key = get_supabase_key()
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -235,7 +234,9 @@ def main():
              "--news", str(OUT_DIR / "news_scan.json"), "--out-dir", str(OUT_DIR)],
             env, 900, "选标的",
         )
-        brief_json = OUT_DIR / f"brief_{brief_stamp}_{session}.json"
+        # pick_candidates 写的文件名是 brief_YYYY-MM-DD_<session>.json（带横杠），
+        # 这里必须用同样的格式，否则 fetch_quotes 读不到候选 JSON。
+        brief_json = OUT_DIR / f"brief_{date_str}_{session}.json"
         run_step(
             ["python3", str(SCRIPTS_DIR / "fetch_quotes.py"), "--market", market,
              "--symbols-json", str(brief_json)],
