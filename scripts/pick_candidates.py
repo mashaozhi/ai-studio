@@ -354,7 +354,7 @@ def call_llm(base_url, api_key, models, is_openrouter, system, user):
         for attempt in (1, 2):
             try:
                 resp = requests.post(
-                    chat_url, headers=headers, data=body, timeout=120
+                    chat_url, headers=headers, data=body, timeout=300
                 )
             except Exception as exc:  # noqa: BLE001 - 网络异常不重试，换下一个
                 last_error = f"{model} 请求异常: {exc}"
