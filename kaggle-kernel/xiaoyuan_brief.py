@@ -9,8 +9,9 @@
   4. 简报写进 Supabase briefs 表（投资策略部空间可读）
 
 场次按北京时间推断：12:00 前跑是早盘（A股+港股），之后是晚盘（美股）。
-密钥：SUPABASE_ANON_KEY 存在 Kaggle Secrets 里（notebook 界面 Add-ons → Secrets），
-不要写进代码。GPU 约 10-20 分钟/次，一周约 3 小时（额度 30 小时/周）。
+密钥：SUPABASE_ANON_KEY 放在私有 Kaggle Dataset xiaoyuan-secrets 的 supabase_key.txt 里
+（Kaggle Secrets 经 CLI 推送触发的 kernel 连不上服务，2026-11-12 两次实测均为
+Connection error，改用 Dataset），不要写进代码。GPU 约 10-20 分钟/次，一周约 3 小时（额度 30 小时/周）。
 """
 
 import json
@@ -162,6 +163,19 @@ def fetch_scripts():
 
 
 def get_supabase_key():
+    """读 SUPABASE_ANON_KEY，优先级：私有 Kaggle Dataset 文件 > Kaggle Secrets > 环境变量。
+
+    Kaggle Secrets（UserSecretsClient）在经 CLI 推送触发的 kernel 里连不上服务
+    （2026-11-12 两次实测均为 Connection error），所以改用私有 Dataset：
+    数据集 xiaoyuan-secrets 里放 supabase_key.txt，kernel 运行时挂载到 /kaggle/input/ 下。
+    """
+    import glob
+
+    for path in glob.glob("/kaggle/input/**/supabase_key.txt", recursive=True):
+        key = Path(path).read_text(encoding="utf-8").strip()
+        if key:
+            logger.info("从 Kaggle Dataset 读到 SUPABASE_ANON_KEY")
+            return key
     try:
         from kaggle_secrets import UserSecretsClient
 
@@ -174,7 +188,8 @@ def get_supabase_key():
     if key:
         return key
     raise RuntimeError(
-        "缺少 SUPABASE_ANON_KEY：请在 Kaggle notebook 界面 Add-ons → Secrets 里添加"
+        "缺少 SUPABASE_ANON_KEY：请确认私有 Dataset xiaoyuan-secrets 里有 supabase_key.txt，"
+        "或在 Kaggle notebook 界面 Add-ons → Secrets 里添加"
     )
 
 
